@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# lemon — edit encrypted files opened on Mac using file extension via a RAM disk, then re-encrypt.
+# Double-click flow: associate .enc with an Automator app that execs this with "$@".
+#
+# Crypto: AES-256-CBC + PBKDF2 (SHA-256, 200k iters). Optional HMAC-SHA256 sidecar (.sig) for integrity.
+#
+# Toggle integrity:
+#   USE_HMAC=1 (default)  → create/verify <file>.enc.sig (recommended)
+#   USE_HMAC=0            → no .sig files, no integrity checking
+
+# ---------------- configuration ----------------
+PASSFILE="${HOME}/.lemon_password"
+VOLNAME="LemonRAM"
+MIN_RAM_MB=512
+PBKDF2_ITER=200000
+MDALG="sha256"
+CIPHER="aes-256-cbc"
+USE_HMAC=${USE_HMAC:-1}
+
+# Prefer Homebrew OpenSSL; respect OPENSSL_BIN if set
+OPENSSL="${OPENSSL_BIN:-}"
+if [[ -z "${OPENSSL}" ]]; then
+  for cand in "/opt/homebrew/bin/openssl" "/opt/homebrew/opt/openssl@3/bin/openssl" "/usr/local/opt/openssl@3/bin/openssl" "/usr/bin/openssl"; do
+    if command -v "$cand" >/dev/null 2>&1; then OPENSSL="$cand"; break; fi
+  done
+fi
+# ------------------------------------------------
+
+die() { echo "Error: $*" >&2; exit 1; }
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
+
+need_cmd "$OPENSSL"
+need_cmd hdiutil
+need_cmd diskutil
+need_cmd stat
+need_cmd awk
+need_cmd cp
+need_cmd mv
+need_cmd rm
+need_cmd sync
+need_cmd grep
+need_cmd tr
+need_cmd open
+
+abspath() (
+  set -e
+  local p="$1"
+  if [[ "$p" == /* ]]; then echo "$p"; else cd "$(dirname "$p")" && printf "%s/%s" "$(pwd)" "$(basename "$p")"; fi
+)
+
+ensure_passfile() {
+  if [[ ! -f "$PASSFILE" ]]; then
+    umask 177
+    "$OPENSSL" rand -base64 48 > "$PASSFILE"
+    chmod 600 "$PASSFILE"
+  fi
+}
+
+# ---- HMAC helpers (enabled only when USE_HMAC=1) ----
+hmac_file() {
+  "$OPENSSL" dgst -"${MDALG}" -hmac "$(cat "$PASSFILE")" -r -- "$1" | awk '{print $1}'
+}
+write_hmac() {
+  [[ "$USE_HMAC" -eq 1 ]] || return 0
+  hmac_file "$1" > "$2"
+}
+verify_hmac() {
+  [[ "$USE_HMAC" -eq 1 ]] || return 0
+  [[ -f "$2" ]] || return 0   # no sig? allow, but no integrity guarantee
+  local want have
+  want="$(tr -d ' \t\r\n' < "$2")"
+  have="$(hmac_file "$1" | tr -d ' \t\r\n')"
+  [[ -n "$want" && "$want" == "$have" ]] || die "HMAC verification failed for $1"
+}
+# -----------------------------------------------------
+
+# RAM disk sizing (512-byte sectors)
+calc_sectors() {
+  local target_bytes="$1"
+  local headroom_factor="1.5"
+  local min_bytes=$(( MIN_RAM_MB * 1024 * 1024 ))
+  local need_bytes
+  need_bytes=$(awk -v a="$target_bytes" -v f="$headroom_factor" 'BEGIN { printf "%.0f", (a * f) }')
+  if (( need_bytes < min_bytes )); then need_bytes=$min_bytes; fi
+  echo $(( (need_bytes + 511) / 512 ))
+}
+
+attach_ramdisk() {
+  local size_bytes="$1"
+  local sectors; sectors="$(calc_sectors "$size_bytes")"
+
+  local dev
+  dev="$(hdiutil attach -nobrowse -nomount "ram://$sectors" | tail -n1 | awk '{print $1}')"
+  [[ -n "$dev" && "$dev" =~ ^/dev/disk[0-9]+$ ]] || die "Unsafe device: $dev"
+
+  # Accept Apple's RAM-backed "Disk Image" virtual device
+  if ! diskutil info "$dev" | grep -Eq \
+     '(^|\s)(Protocol:\s*(RAM|Disk Image)|Virtual:\s*Yes|Media Type:\s*RAM|Device / Media Name:\s*(RAM Disk|Disk Image))'; then
+    die "$dev does not appear to be a RAM/virtual disk"
+  fi
+
+  local tries=0
+  until diskutil eraseVolume APFS "$VOLNAME" "$dev" >/dev/null 2>&1; do
+    ((tries+=1))
+    [[ $tries -ge 3 ]] && die "Failed to format RAM disk ($dev)"
+    sleep 0.3
+  done
+
+  echo "$dev|/Volumes/$VOLNAME"
+}
+
+detach_ramdisk() {
+  local dev="$1"
+  [[ -n "$dev" ]] || return 0
+  sync || true
+  diskutil eject "$dev" >/dev/null 2>&1 || diskutil unmountDisk force "$dev" >/dev/null 2>&1 || true
+}
+
+# Encryption / decryption
+do_encrypt() {
+  "$OPENSSL" enc -"${CIPHER}" -salt -pbkdf2 -iter "$PBKDF2_ITER" -md "$MDALG" \
+    -in "$1" -out "$2" -pass "file:$PASSFILE"
+}
+do_decrypt() {
+  "$OPENSSL" enc -d -"${CIPHER}" -pbkdf2 -iter "$PBKDF2_ITER" -md "$MDALG" \
+    -in "$1" -out "$2" -pass "file:$PASSFILE"
+}
+
+# Open file in typed app as a fresh instance and wait for that instance to quit.
+open_and_wait() {
+  local path="$1"
+  # -n new instance; -W wait; -F fresh (don’t restore windows)
+  echo $path
+  open -n -W -F  "$path"
+}
+
+# ---------------- main ----------------
+[[ $# -ge 1 ]] || die "No file path provided."
+INPATH="$(abspath "$1")"
+[[ -e "$INPATH" ]] || die "File not found: $INPATH"
+FILENAME="$(basename "$INPATH")"
+
+ensure_passfile
+IS_ENC=0; [[ "$FILENAME" == *.enc ]] && IS_ENC=1
+
+RAMDEV=""
+trap 'detach_ramdisk "$RAMDEV"' EXIT INT TERM
+
+if (( IS_ENC == 1 )); then
+  # Decrypt/edit/re-encrypt
+  PLAIN_NAME="${FILENAME%.enc}"
+  SIGPATH="${INPATH}.sig"
+
+  verify_hmac "$INPATH" "$SIGPATH"
+
+  IN_BYTES=$(stat -f "%z" "$INPATH")
+  IFS="|" read -r RAMDEV RAMMNT < <(attach_ramdisk "$IN_BYTES")
+  OUTPATH_RAM="${RAMMNT}/${PLAIN_NAME}"
+
+  do_decrypt "$INPATH" "$OUTPATH_RAM" || die "Decryption failed"
+
+  # Backup current ciphertext (and sig if present)
+  BACKUP="${INPATH%.enc}.enc.bak"
+  cp -p "$INPATH" "$BACKUP"
+  if [[ "$USE_HMAC" -eq 1 && -f "$SIGPATH" ]]; then cp -p "$SIGPATH" "${BACKUP}.sig"; fi
+
+  # Open file with a fresh instance and wait
+  open_and_wait "$OUTPATH_RAM"
+
+  # Re-encrypt and refresh HMAC
+  TMP_NEW="${INPATH}.new"
+  do_encrypt "$OUTPATH_RAM" "$TMP_NEW"
+  mv -f "$TMP_NEW" "$INPATH"
+  if [[ "$USE_HMAC" -eq 1 ]]; then write_hmac "$INPATH" "$SIGPATH"; fi
+
+  echo "Re-encrypted to: $INPATH"
+  [[ "$USE_HMAC" -eq 1 ]] && echo "HMAC written: $SIGPATH"
+  echo "Backup kept:  $BACKUP"
+
+else
+  # Encrypt plaintext -> *.enc (+ optional .sig)
+  PLAIN_BYTES=$(stat -f "%z" "$INPATH")
+  IFS="|" read -r RAMDEV RAMMNT < <(attach_ramdisk "$PLAIN_BYTES")
+
+  PLAIN_RAM="${RAMMNT}/${FILENAME}"
+  cp -p "$INPATH" "$PLAIN_RAM"
+
+  OUT_ENC="${INPATH}.enc"
+  do_encrypt "$PLAIN_RAM" "$OUT_ENC"
+  if [[ "$USE_HMAC" -eq 1 ]]; then write_hmac "$OUT_ENC" "${OUT_ENC}.sig"; fi
+
+  echo "Encrypted to: $OUT_ENC"
+  [[ "$USE_HMAC" -eq 1 ]] && echo "HMAC written: ${OUT_ENC}.sig"
+fi
