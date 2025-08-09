@@ -26,3 +26,8 @@ for f in "$@"; do
 done
 ```
 
+Save the Automator script to your /Application/ directory. Use "Get Info" in the finder to associate .enc files with .enc
+
+### Optionality
+
+Consider changing the extension to `.lenc` instead of `.enc` for lemon encryption versus other encryption processes you might be using.  
